@@ -255,7 +255,7 @@ def replace_brand_text_in_doc(doc, W: str) -> int:
                     break
             for domain in _publisher_domains():
                 if domain.lower() in full.lower():
-                    count += _replace_alias_across_runs(p_elem, domain, "publisher.com", W)
+                    count += _replace_alias_across_runs(p_elem, domain, "lorumipsum.com", W)
             if hit_alias is None:
                 continue
             if len(full) <= len(hit_alias) + 10:
@@ -269,7 +269,7 @@ def replace_brand_text_in_doc(doc, W: str) -> int:
                     pass
                 count += 1
             else:
-                count += _replace_alias_across_runs(p_elem, hit_alias, "Publisher", W)
+                count += _replace_alias_across_runs(p_elem, hit_alias, "Lorum Ipsum", W)
     return count
 
 
@@ -285,8 +285,8 @@ def replace_brand_text_in_pdf(pdf_path: Path) -> int:
     for page in doc:
         edits = []
         d = page.get_text("dict")
-        targets = [(a, "Publisher") for a in aliases] + [
-            (d, "publisher.com") for d in _publisher_domains()
+        targets = [(a, "Lorum Ipsum") for a in aliases] + [
+            (d, "lorumipsum.com") for d in _publisher_domains()
         ]
         for block in d["blocks"]:
             for line in block.get("lines", []):
@@ -311,7 +311,7 @@ def replace_brand_text_in_pdf(pdf_path: Path) -> int:
             page.add_redact_annot(r)
         page.apply_redactions()
         for r, size, color, _, repl in edits:
-            if size >= _WORDMARK_MIN_PT and repl == "Publisher":
+            if size >= _WORDMARK_MIN_PT and repl == "Lorum Ipsum":
                 dummy = _random_dummy_bytes((int(r.width * 2), int(r.height * 2)), "PNG")
                 fit_r = fitz.Rect(r.x0, r.y0, min(r.x0 + r.height * 2.5, page.rect.width), r.y1)
                 page.insert_image(fit_r, stream=dummy)
