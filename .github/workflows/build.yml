@@ -33,8 +33,22 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Build executable
+        if: matrix.os != 'windows-latest'
         run: >
           pyinstaller --onefile --windowed --name DocumentSanitizer
+          --add-data "sanitizer/assets:sanitizer/assets"
+          --exclude-module torch --exclude-module torchvision --exclude-module torchaudio
+          --exclude-module torchao --exclude-module triton --exclude-module nvidia
+          --exclude-module spacy --exclude-module transformers --exclude-module sklearn
+          --exclude-module scipy --exclude-module pandas --exclude-module matplotlib
+          --exclude-module litellm --exclude-module IPython --exclude-module tensorboard
+          sanitizer_gui.py
+
+      - name: Build executable (Windows)
+        if: matrix.os == 'windows-latest'
+        run: >
+          pyinstaller --onefile --windowed --name DocumentSanitizer
+          --add-data "sanitizer/assets;sanitizer/assets"
           --exclude-module torch --exclude-module torchvision --exclude-module torchaudio
           --exclude-module torchao --exclude-module triton --exclude-module nvidia
           --exclude-module spacy --exclude-module transformers --exclude-module sklearn

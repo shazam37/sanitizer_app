@@ -24,18 +24,35 @@ def collect_inputs(paths):
 
 
 def process_file(path: Path, out_dir: Path) -> dict:
-    docx_path, is_temp = to_docx(path)
+    import shutil
+    import tempfile
+
+    from .logos import replace_logos_in_docx
+
+    docx_path, is_temp, logos = to_docx(path)
     try:
+        if not is_temp:
+            tmp = Path(tempfile.mkdtemp(prefix="sanitizer_"))
+            work = tmp / path.name
+            shutil.copy(path, work)
+            logos += replace_logos_in_docx(work)
+            docx_path = work
+            is_temp = True
         doc = Document(str(docx_path))
+        from .logos import replace_brand_text_in_doc, replace_vector_logos_in_doc
+
+        logos += replace_vector_logos_in_doc(doc, W="http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+        logos += replace_brand_text_in_doc(
+            doc, W="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        )
         stats = sanitize_document(doc)
         tag = "" if path.suffix.lower() == ".docx" else "_" + path.suffix.lower().lstrip(".")
         out_path = out_dir / f"{path.stem}{tag}_sanitized.docx"
         doc.save(str(out_path))
     finally:
         if is_temp:
-            import shutil
-
             shutil.rmtree(docx_path.parent, ignore_errors=True)
+    stats["logos_replaced"] = logos
     return {"input": path, "output": out_path, **stats}
 
 
@@ -63,6 +80,7 @@ def main(argv=None):
             print(
                 f"[OK] {f.name} -> {r['output'].name} "
                 f"(watermarks removed: {r['watermarks_removed']}, words replaced: {r['words_replaced']}, "
+                f"logos replaced: {r['logos_replaced']}, "
                 f"sections fixed: {r['sections_fixed']}, shapes scaled: {r['shapes_scaled']})"
             )
         except Exception as e:

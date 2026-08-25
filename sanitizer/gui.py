@@ -2,6 +2,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .cli import collect_inputs
@@ -140,8 +141,27 @@ class SanitizerGUI:
             for i, path in enumerate(items, 1):
                 self.log(f"[{i}/{len(items)}] {os.path.basename(str(path))}")
                 try:
-                    docx_path, is_temp = to_docx(path)
+                    docx_path, is_temp, logos_found = to_docx(path)
+                    if not is_temp:
+                        import shutil
+                        import tempfile
+
+                        from .logos import replace_logos_in_docx
+
+                        tmp = Path(tempfile.mkdtemp(prefix="sanitizer_"))
+                        work = tmp / path.name
+                        shutil.copy(str(path), str(work))
+                        logos_found += replace_logos_in_docx(work)
+                        docx_path = work
+                        is_temp = True
                     doc = Document(str(docx_path))
+                    from .logos import replace_brand_text_in_doc, replace_vector_logos_in_doc
+
+                    logos_found += replace_vector_logos_in_doc(doc, W="http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                    logos_found += replace_brand_text_in_doc(
+                        doc,
+                        W="http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                    )
                     stats = sanitize_document(doc)
                     tag = "" if path.suffix.lower() == ".docx" else "_" + path.suffix.lower().lstrip(".")
                     out_path = os.path.join(out_dir, f"{path.stem}{tag}_sanitized.docx")
@@ -154,6 +174,7 @@ class SanitizerGUI:
                         f"    done -> {os.path.basename(out_path)} "
                         f"(watermarks removed: {stats['watermarks_removed']}, "
                         f"words replaced: {stats['words_replaced']}, "
+                        f"logos replaced: {logos_found}, "
                         f"sections fixed: {stats['sections_fixed']}, "
                         f"shapes scaled: {stats['shapes_scaled']})"
                     )

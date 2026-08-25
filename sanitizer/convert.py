@@ -151,11 +151,27 @@ def word_docx_to_pdf(docx_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
-def pdf_to_docx(pdf_path: Path, out_dir: Path) -> Path:
+def _replace_text_logos(docx_path: Path) -> int:
+    from .logos import replace_brand_text_in_doc, replace_vector_logos_in_doc
+
+    doc = Document(str(docx_path))
+    n = replace_vector_logos_in_doc(doc, W="http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+    n += replace_brand_text_in_doc(doc, W="http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+    if n:
+        doc.save(str(docx_path))
+    return n
+
+
+def pdf_to_docx(pdf_path: Path, out_dir: Path) -> tuple[Path, int]:
     out_dir.mkdir(parents=True, exist_ok=True)
     clean = _redact_watermark(pdf_path)
     temps = [clean] if clean != pdf_path else []
+    logos_replaced = 0
     try:
+        from .logos import replace_logos_in_pdf, replace_brand_text_in_pdf
+
+        logos_replaced += replace_logos_in_pdf(clean)
+        logos_replaced += replace_brand_text_in_pdf(clean)
         portrait = _portraitize_pdf(clean)
         if portrait != clean:
             temps.append(portrait)
@@ -178,7 +194,7 @@ def pdf_to_docx(pdf_path: Path, out_dir: Path) -> Path:
     finally:
         for t in temps:
             t.unlink(missing_ok=True)
-    return out_path
+    return out_path, logos_replaced
 
 
 def _page_content_width(doc, section_index: int) -> Emu:
@@ -261,24 +277,32 @@ def doc_to_docx(doc_path: Path, out_dir: Path) -> Path:
     return converted
 
 
-def to_docx(path: Path) -> tuple[Path, bool]:
-    """Return (docx_path, is_temp_copy)."""
+def to_docx(path: Path) -> tuple[Path, bool, int]:
+    """Return (docx_path, is_temp_copy, logos_replaced)."""
+    from .logos import replace_logos_in_docx
+
     ext = path.suffix.lower()
     tmp = Path(tempfile.mkdtemp(prefix="sanitizer_"))
+    logos = 0
     if ext == ".docx":
         if _has_landscape(path):
             work = tmp / path.name
             work.write_bytes(path.read_bytes())
+            logos += replace_logos_in_docx(work)
+            logos += _replace_text_logos(work)
             replace_landscape_pages_with_images(work)
-            return work, True
-        return path, False
+            return work, True, logos
+        return path, False, 0
     if ext == ".pdf":
-        return pdf_to_docx(path, tmp), True
+        converted, n = pdf_to_docx(path, tmp)
+        return converted, True, n
     if ext == ".doc":
         converted = doc_to_docx(path, tmp)
+        logos += replace_logos_in_docx(converted)
+        logos += _replace_text_logos(converted)
         if _has_landscape(converted):
             replace_landscape_pages_with_images(converted)
-        return converted, True
+        return converted, True, logos
     raise ValueError(f"Unsupported file type: {path}")
 
 def _portraitize_pdf(pdf_path: Path) -> Path:
