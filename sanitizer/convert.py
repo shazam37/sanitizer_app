@@ -100,6 +100,57 @@ def _redact_page(page) -> bool:
     return True
 
 
+class MSWord:
+    """MS Word COM automation context (Windows only)."""
+
+    def __init__(self):
+        import pythoncom
+        import win32com.client
+
+        self._pythoncom = pythoncom
+        pythoncom.CoInitialize()
+        self.app = win32com.client.DispatchEx("Word.Application")
+        self.app.Visible = False
+        self.app.DisplayAlerts = 0
+
+    def __enter__(self):
+        return self.app
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.app.Quit(0)
+        except Exception:
+            pass
+        self._pythoncom.CoUninitialize()
+        return False
+
+
+def word_doc_to_docx(doc_path: Path, out_dir: Path) -> Path:
+    out_path = (out_dir / (doc_path.stem + ".docx")).resolve()
+    with MSWord() as word:
+        doc = word.Documents.Open(str(doc_path.resolve()), ReadOnly=True)
+        try:
+            doc.SaveAs2(str(out_path), FileFormat=16)
+        finally:
+            doc.Close(0)
+    if not out_path.exists():
+        raise RuntimeError(f"MS Word failed to convert {doc_path.name}")
+    return out_path
+
+
+def word_docx_to_pdf(docx_path: Path, out_dir: Path) -> Path:
+    out_path = (out_dir / (docx_path.stem + ".pdf")).resolve()
+    with MSWord() as word:
+        doc = word.Documents.Open(str(docx_path.resolve()), ReadOnly=True)
+        try:
+            doc.ExportAsFixedFormat(str(out_path), ExportFormat=17)
+        finally:
+            doc.Close(0)
+    if not out_path.exists():
+        raise RuntimeError(f"MS Word failed to export {docx_path.name} to PDF")
+    return out_path
+
+
 def pdf_to_docx(pdf_path: Path, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     clean = _redact_watermark(pdf_path)
@@ -178,11 +229,16 @@ def _page_break_para(doc):
 
 def doc_to_docx(doc_path: Path, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        try:
+            return word_doc_to_docx(doc_path, out_dir)
+        except ImportError:
+            pass
     soffice = find_soffice()
     if not soffice:
         raise LibreOfficeNotFoundError(
-            f"Cannot convert '{doc_path.name}': legacy .doc files require LibreOffice "
-            "(https://www.libreoffice.org) or Microsoft Word. "
+            f"Cannot convert '{doc_path.name}': legacy .doc files require Microsoft Word "
+            "or LibreOffice (https://www.libreoffice.org). "
             "Please save the file as .docx or .pdf and try again."
         )
     result = subprocess.run(
@@ -295,24 +351,32 @@ def replace_landscape_pages_with_images(docx_path: Path) -> int:
     body, children, landscape = _find_landscape_ranges(doc2.element)
     if not landscape:
         return 0
-    if not find_soffice():
-        return 0
-
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="sanitizer_ls_") as td:
         tdp = Path(td)
-        result = subprocess.run(
-            [find_soffice(), "--headless", "--convert-to", "pdf", "--outdir", str(tdp), str(docx_path)],
-            capture_output=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            return 0
-        pdfs = list(tdp.glob("*.pdf"))
-        if not pdfs:
-            return 0
-        redacted = _redact_watermark(pdfs[0])
+        rendered = None
+        if sys.platform == "win32":
+            try:
+                rendered = word_docx_to_pdf(docx_path, tdp)
+            except ImportError:
+                rendered = None
+        if rendered is None:
+            soffice = find_soffice()
+            if not soffice:
+                return 0
+            result = subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tdp), str(docx_path)],
+                capture_output=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                return 0
+            pdfs = list(tdp.glob("*.pdf"))
+            if not pdfs:
+                return 0
+            rendered = pdfs[0]
+        redacted = _redact_watermark(rendered)
         doc = fitz.open(str(redacted))
         ls_pages = [p for p in doc if p.rect.width > p.rect.height]
         if len(ls_pages) != len(landscape):
