@@ -1,7 +1,10 @@
 import io
 import logging
+import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -13,6 +16,45 @@ from pdf2docx import Converter
 
 WATERMARK_TOKENS = ("licensed", "drishti", "khanna", "mecstudio")
 FAILED_PAGE_RE = re.compile(r"Ignore page (\d+) due to making page error")
+
+_SOFFICE_CACHE = None
+
+
+def find_soffice():
+    global _SOFFICE_CACHE
+    if _SOFFICE_CACHE is not None:
+        return _SOFFICE_CACHE
+    override = os.environ.get("SANITIZER_SOFFICE")
+    if override and Path(override).exists():
+        _SOFFICE_CACHE = override
+        return _SOFFICE_CACHE
+    for name in ("soffice", "soffice.exe"):
+        found = shutil.which(name)
+        if found:
+            _SOFFICE_CACHE = found
+            return _SOFFICE_CACHE
+    candidates = []
+    if os.name == "nt":
+        program_dirs = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                        os.environ.get("LOCALAPPDATA", r"C:\Program Files")]
+        for base in program_dirs:
+            candidates.extend([Path(base) / "LibreOffice" / "program" / "soffice.exe"])
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/LibreOffice.app/Contents/MacOS/soffice"))
+    else:
+        candidates.extend([Path("/usr/bin/soffice"), Path("/usr/local/bin/soffice"),
+                           Path("/opt/libreoffice/program/soffice")])
+    for cand in candidates:
+        if cand.exists():
+            _SOFFICE_CACHE = str(cand)
+            return _SOFFICE_CACHE
+    _SOFFICE_CACHE = ""
+    return _SOFFICE_CACHE
+
+
+class LibreOfficeNotFoundError(RuntimeError):
+    pass
 
 
 class _FailureCollector(logging.Handler):
@@ -136,9 +178,16 @@ def _page_break_para(doc):
 
 def doc_to_docx(doc_path: Path, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    soffice = find_soffice()
+    if not soffice:
+        raise LibreOfficeNotFoundError(
+            f"Cannot convert '{doc_path.name}': legacy .doc files require LibreOffice "
+            "(https://www.libreoffice.org) or Microsoft Word. "
+            "Please save the file as .docx or .pdf and try again."
+        )
     result = subprocess.run(
         [
-            "soffice",
+            soffice,
             "--headless",
             "--convert-to",
             "docx",
@@ -246,16 +295,20 @@ def replace_landscape_pages_with_images(docx_path: Path) -> int:
     body, children, landscape = _find_landscape_ranges(doc2.element)
     if not landscape:
         return 0
+    if not find_soffice():
+        return 0
 
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="sanitizer_ls_") as td:
         tdp = Path(td)
-        subprocess.run(
-            ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(tdp), str(docx_path)],
+        result = subprocess.run(
+            [find_soffice(), "--headless", "--convert-to", "pdf", "--outdir", str(tdp), str(docx_path)],
             capture_output=True,
             timeout=300,
         )
+        if result.returncode != 0:
+            return 0
         pdfs = list(tdp.glob("*.pdf"))
         if not pdfs:
             return 0
