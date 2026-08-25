@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+sanitized_output/
+docs/
+pdf/
+*.clean.pdf
+*.portrait.pdf
+*_sanitized.docx

@@ -1,0 +1,63 @@
+name: Build Desktop App
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: DocumentSanitizer-Windows.zip
+            exe: dist/DocumentSanitizer.exe
+          - os: macos-latest
+            artifact: DocumentSanitizer-macOS.zip
+            exe: dist/DocumentSanitizer.app
+          - os: ubuntu-22.04
+            artifact: DocumentSanitizer-Linux.tar.gz
+            exe: dist/DocumentSanitizer
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: >
+          pyinstaller --onefile --windowed --name DocumentSanitizer
+          --exclude-module torch --exclude-module torchvision --exclude-module torchaudio
+          --exclude-module torchao --exclude-module triton --exclude-module nvidia
+          --exclude-module spacy --exclude-module transformers --exclude-module sklearn
+          --exclude-module scipy --exclude-module pandas --exclude-module matplotlib
+          --exclude-module litellm --exclude-module IPython --exclude-module tensorboard
+          sanitizer_gui.py
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: Compress-Archive -Path dist/DocumentSanitizer.exe -DestinationPath ${{ matrix.artifact }}
+
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd dist
+          zip -r ../${{ matrix.artifact }} DocumentSanitizer.app
+
+      - name: Package (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: tar czf ${{ matrix.artifact }} -C dist DocumentSanitizer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
