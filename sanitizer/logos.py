@@ -392,10 +392,10 @@ def _hue_matches(hex_color: str, brand_hues) -> bool:
 
 
 def replace_vector_logos_in_doc(doc, W: str) -> int:
-    """Replace tracked-brand vector logos found in headers, footers and the
-    document-top corner with a random dummy of the same size/proportion.
-    Adjacent shapes forming one lockup merge into a single dummy.
-    The document body is never touched."""
+    """Replace tracked-brand vector logos in headers, footers and page-top
+    corners with a random dummy of the same size/proportion. Adjacent shapes
+    forming one lockup merge into a single dummy. Mid-page body content is
+    never touched."""
     import io as _io
     import re as _re
 
@@ -431,17 +431,29 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
                 groups.append((part._element, part))
             except Exception:
                 continue
-    top_corner = [
-        pict for pict in root.iter(f"{{{W}}}pict")
-        if index_of.get(id(pict), 10**9) < first_text_idx
-    ]
-    groups.append((top_corner, None))
 
-    replaced = 0
-    for members, parent in groups:
+    body = root.find(f"{{{W}}}body")
+    children = list(body)
+    corner_zone = set()
+    start = 0
+    boundaries = [i for i, ch in enumerate(children) if ch.tag == f"{{{W}}}sectPr" or ch.find(f"{{{W}}}pPr/{{{W}}}sectPr") is not None]
+    boundaries.append(len(children) - 1)
+    for e in boundaries:
+        first_text = None
+        for i in range(start, e + 1):
+            txt = "".join(children[i].itertext())
+            if len(txt.strip()) > 100:
+                first_text = i
+                break
+        limit = max(first_text if first_text is not None else 0, min(start + 8, e))
+        for i in range(start, min(limit + 1, e + 1)):
+            corner_zone.add(children[i])
+        start = e + 1
+
+    def _collect(members, corner_only):
         cands = []
-        pict_iter = members if isinstance(members, list) else members.iter(f"{{{W}}}pict")
-        for pict in list(pict_iter):
+        iterator = members if isinstance(members, list) else members.iter(f"{{{W}}}pict")
+        for pict in list(iterator):
             if pict.find(f".//{{{V}}}imagedata") is not None:
                 continue
             if pict.find(f".//{{{W}}}txbxContent") is not None:
@@ -463,8 +475,17 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
                 continue
             w_pt = float(m_w.group(1))
             h_pt = float(m_h.group(1))
-            if not (4 <= h_pt <= 170 and 5 <= w_pt <= 550):
+            max_h = 120 if corner_only else 170
+            max_w = 300 if corner_only else 550
+            if not (4 <= h_pt <= max_h and 5 <= w_pt <= max_w):
                 continue
+            if corner_only:
+                run_el = pict.getparent()
+                while run_el is not None and run_el.tag != f"{{{W}}}r":
+                    run_el = run_el.getparent()
+                p_el = run_el.getparent() if run_el is not None else None
+                if p_el is None or p_el not in corner_zone:
+                    continue
             if not color_hit:
                 fills = [cl.lower() for cl in colors if cl]
                 if not fills or not all(f in ("#000000", "black", "#000") for f in fills):
@@ -481,6 +502,14 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
                 "mt": float(m_t.group(1)) if m_t else 0.0,
                 "w": w_pt, "h": h_pt,
             })
+        return cands
+
+    corner_picts = [pict for p_el in corner_zone for pict in p_el.iter(f"{{{W}}}pict")]
+    groups.append((corner_picts, None))
+
+    replaced = 0
+    for members, parent in groups:
+        cands = _collect(members, corner_only=(parent is None))
         if not cands:
             continue
         cands.sort(key=lambda cd: (id(cd["p"]), cd["ml"]))
@@ -508,15 +537,19 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             w_pt = max(x1 - x0, 15)
             h_pt = max(y1 - y0, 8)
             anchor_p = cluster[0]["p"]
-            para = _Paragraph(anchor_p, parent if parent else doc)
+            para = _Paragraph(anchor_p, doc)
             new_run = para.add_run()
             buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
             new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
             anchor_p.remove(new_run._r)
             cluster[0]["run"].addnext(new_run._r)
+            spacing = anchor_p.find(f"{{{W}}}pPr/{{{W}}}spacing")
+            if spacing is not None:
+                spacing.set(f"{{{W}}}line", str(int(h_pt * 20 * 1.15)))
+                spacing.set(f"{{{W}}}lineRule", "atLeast")
             for cd in cluster:
-                if cd["run"].getparent() is cd["p"]:
-                    cd["p"].remove(cd["run"])
+                if cd["run"].getparent() is anchor_p:
+                    anchor_p.remove(cd["run"])
             replaced += 1
     return replaced
 
