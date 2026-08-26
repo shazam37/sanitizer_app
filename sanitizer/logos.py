@@ -505,7 +505,7 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
         return cands
 
     corner_picts = [pict for p_el in corner_zone for pict in p_el.iter(f"{{{W}}}pict")]
-    groups.append((corner_picts, None))
+    groups.append((corner_picts, doc))
 
     replaced = 0
     for members, parent in groups:
@@ -537,7 +537,7 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             w_pt = max(x1 - x0, 15)
             h_pt = max(y1 - y0, 8)
             anchor_p = cluster[0]["p"]
-            para = _Paragraph(anchor_p, doc)
+            para = _Paragraph(anchor_p, parent)
             new_run = para.add_run()
             buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
             new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
