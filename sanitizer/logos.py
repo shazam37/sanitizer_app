@@ -223,7 +223,7 @@ def replace_brand_text_in_doc(doc, W: str) -> int:
     other mentions become 'Publisher'. Operates on a python-docx Document."""
     import io as _io
 
-    from docx.shared import Inches as _Inches
+    from docx.shared import Emu as _Emu
     from docx.text.paragraph import Paragraph as _Paragraph
 
     _load_references()
@@ -262,10 +262,26 @@ def replace_brand_text_in_doc(doc, W: str) -> int:
             if len(full) <= len(hit_alias) + 10:
                 for run in list(para.runs):
                     run.text = ""
+                size_pt = 0
+                for r_el in p_elem.findall(f".//{{{W}}}sz"):
+                    try:
+                        size_pt = max(size_pt, int(r_el.get(f"{{{W}}}val", "0")) / 2)
+                    except (TypeError, ValueError):
+                        continue
+                if size_pt <= 0:
+                    size_pt = 14.0
+                width_pt = min(size_pt * 0.6 * max(len(hit_alias), 1), 550)
+                height_pt = min(size_pt * 1.3, 170)
                 try:
                     run = para.add_run()
-                    buf = _io.BytesIO(_random_dummy_bytes((383, 382), "PNG"))
-                    run.add_picture(buf, width=_Inches(1.6))
+                    buf = _io.BytesIO(
+                        _random_dummy_bytes((int(width_pt * 4), int(height_pt * 4)), "PNG")
+                    )
+                    run.add_picture(
+                        buf,
+                        width=_Emu(int(width_pt * 12700)),
+                        height=_Emu(int(height_pt * 12700)),
+                    )
                 except Exception:
                     pass
                 count += 1
