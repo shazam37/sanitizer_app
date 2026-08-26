@@ -392,12 +392,12 @@ def _hue_matches(hex_color: str, brand_hues) -> bool:
 
 
 def replace_vector_logos_in_doc(doc, W: str) -> int:
-    """Replace vector logos in headers, footers and the document-top corner
-    with a random dummy of the same size/proportion. Adjacent shapes forming
-    one lockup are merged into a single dummy."""
+    """Replace tracked-brand vector logos found in headers, footers and the
+    document-top corner with a random dummy of the same size/proportion.
+    Adjacent shapes forming one lockup merge into a single dummy.
+    The document body is never touched."""
     import io as _io
     import re as _re
-    from lxml import etree as _etree
 
     from docx.shared import Emu as _Emu
     from docx.text.paragraph import Paragraph as _Paragraph
@@ -417,7 +417,7 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
     if first_text_idx is None:
         return 0
 
-    story_roots = []
+    groups = []
     for section in doc.sections:
         for part in (
             section.header,
@@ -428,14 +428,23 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             section.even_page_footer,
         ):
             try:
-                story_roots.append((part._element, part))
+                groups.append((part._element, part))
             except Exception:
                 continue
+    top_corner = [
+        pict for pict in root.iter(f"{{{W}}}pict")
+        if index_of.get(id(pict), 10**9) < first_text_idx
+    ]
+    groups.append((top_corner, None))
 
-    def _collect(root, is_hf):
+    replaced = 0
+    for members, parent in groups:
         cands = []
-        for pict in list(root.iter(f"{{{W}}}pict")):
+        pict_iter = members if isinstance(members, list) else members.iter(f"{{{W}}}pict")
+        for pict in list(pict_iter):
             if pict.find(f".//{{{V}}}imagedata") is not None:
+                continue
+            if pict.find(f".//{{{W}}}txbxContent") is not None:
                 continue
             colors = [
                 el.get("fillcolor", "") for el in pict.iter() if el.get("fillcolor")
@@ -452,21 +461,13 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             m_t = _re.search(r"margin-top:([-\d.]+)pt", style)
             if not (m_w and m_h):
                 continue
-            w_pt, h_pt = float(m_w.group(1)), float(m_h.group(1))
-            max_h = 120 if is_hf else 170
-            if not (4 <= h_pt <= max_h and 5 <= w_pt <= 550):
+            w_pt = float(m_w.group(1))
+            h_pt = float(m_h.group(1))
+            if not (4 <= h_pt <= 170 and 5 <= w_pt <= 550):
                 continue
-            shape_count = sum(
-                1 for el in pict.iter() if el.tag in (f"{{{V}}}shape", f"{{{V}}}group")
-            )
-            if shape_count > (400 if is_hf else 120):
-                continue
-            black_wordmark = False
             if not color_hit:
                 fills = [cl.lower() for cl in colors if cl]
-                if fills and all(f in ("#000000", "black", "#000") for f in fills):
-                    black_wordmark = True
-                if not black_wordmark:
+                if not fills or not all(f in ("#000000", "black", "#000") for f in fills):
                     continue
             run_el = pict.getparent()
             while run_el is not None and run_el.tag != f"{{{W}}}r":
@@ -479,13 +480,7 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
                 "ml": float(m_l.group(1)) if m_l else 0.0,
                 "mt": float(m_t.group(1)) if m_t else 0.0,
                 "w": w_pt, "h": h_pt,
-                "color_hit": color_hit, "black": black_wordmark,
             })
-        return cands
-
-    replaced = 0
-    for root, parent in story_roots + [(root, doc)]:
-        cands = _collect(root, False)
         if not cands:
             continue
         cands.sort(key=lambda cd: (id(cd["p"]), cd["ml"]))
@@ -512,106 +507,21 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             y1 = max(cd["mt"] + cd["h"] for cd in cluster)
             w_pt = max(x1 - x0, 15)
             h_pt = max(y1 - y0, 8)
-            para = _Paragraph(cluster[0]["p"], parent)
+            anchor_p = cluster[0]["p"]
+            para = _Paragraph(anchor_p, parent if parent else doc)
             new_run = para.add_run()
             buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
             new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
-            anchor_p = cluster[0]["p"]
             anchor_p.remove(new_run._r)
             cluster[0]["run"].addnext(new_run._r)
             for cd in cluster:
-                cd["p"].remove(cd["run"])
+                if cd["run"].getparent() is cd["p"]:
+                    cd["p"].remove(cd["run"])
             replaced += 1
     return replaced
 
 
-def _verify_clusters_via_render(unique: dict) -> set:
-    """Render candidate clusters in a scratch document and perceptual-hash
-    each against the reference logos. Returns signatures that match."""
-    import subprocess as _subprocess
-    import tempfile as _tempfile
-    from docx.enum.text import WD_BREAK as _WD_BREAK
 
-    from docx import Document as _Document
-    from docx.shared import Emu as _Emu
-
-    from .convert import find_soffice, word_docx_to_pdf
-
-    soffice = find_soffice()
-    use_word = False
-    if not soffice:
-        if sys.platform == "win32":
-            use_word = True
-        else:
-            return set()
-    items = list(unique.items())
-    with _tempfile.TemporaryDirectory(prefix="sanitizer_vec_") as td:
-        td_path = Path(td)
-        vdoc = _Document()
-        sec = vdoc.sections[0]
-        def _cluster_extent(cl):
-            xs = [cd["ml"] + cd["w"] for cd in cl[0] if cd["ml"] is not None]
-            ys = [cd["mt"] + cd["h"] for cd in cl[0] if cd["mt"] is not None]
-            return (max(xs) if xs else 100), (max(ys) if ys else 40)
-
-        max_w = max(_cluster_extent(cl)[0] for cl in unique.values())
-        max_h = max(_cluster_extent(cl)[1] for cl in unique.values())
-        sec.page_width = _Emu(int((max_w + 20) * 12700))
-        sec.page_height = _Emu(int((max_h + 20) * 12700))
-        sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = _Emu(0)
-        import copy as _copy
-
-        for sig, cluster_list in items:
-            rep = cluster_list[0]
-            p = vdoc.add_paragraph()
-            p.paragraph_format.space_before = _Emu(0)
-            p.paragraph_format.space_after = _Emu(0)
-            for cd in sorted(rep, key=lambda x: x["ml"] if x["ml"] is not None else 0):
-                run = p.add_run()
-                run._r.append(_copy.deepcopy(cd["pict"]))
-            vdoc.add_paragraph().add_run().add_break(_WD_BREAK.PAGE)
-        vdoc_path = td_path / "verify.docx"
-        vdoc.save(str(vdoc_path))
-        pdf_path = td_path / "verify.pdf"
-        if use_word:
-            try:
-                pdf_path = word_docx_to_pdf(vdoc_path, td_path)
-            except Exception:
-                return set()
-        else:
-            result = _subprocess.run(
-                [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(td), str(vdoc_path)],
-                capture_output=True,
-                timeout=300,
-            )
-            if result.returncode != 0 or not pdf_path.exists():
-                return set()
-        import fitz as _fitz
-
-        pdf = _fitz.open(str(pdf_path))
-        _fitz.TOOLS.mupdf_display_errors(False)
-        matched = set()
-        items = items[:120]
-        for i, (sig, cluster_list) in enumerate(items):
-            if i >= len(pdf):
-                break
-            rep = cluster_list[0]
-            mls = [cd["ml"] for cd in rep if cd["ml"] is not None]
-            mts = [cd["mt"] for cd in rep if cd["mt"] is not None]
-            x0 = min(mls) - 3 if mls else 0
-            x1 = max(cd["ml"] + cd["w"] for cd in rep if cd["ml"] is not None) + 3 if mls else sum(cd["w"] for cd in rep)
-            y0 = min(mts) - 3 if mts else 0
-            y1 = max(cd["mt"] + cd["h"] for cd in rep if cd["mt"] is not None) + 3 if mts else max(cd["h"] for cd in rep) + 6
-            pix = pdf[i].get_pixmap(dpi=150, clip=_fitz.Rect(max(x0, 0), max(y0, 0), x1, y1))
-            try:
-                img = Image.open(_io.BytesIO(pix.tobytes("png"))).convert("RGB")
-            except Exception:
-                continue
-            h = imagehash.average_hash(img, _HASH_SIZE)
-            if any(h - ref <= 18 for ref in _publisher_hashes):
-                matched.add(sig)
-        pdf.close()
-    return matched
 
 
 V = "urn:schemas-microsoft-com:vml"

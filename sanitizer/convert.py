@@ -383,24 +383,30 @@ def replace_landscape_pages_with_images(docx_path: Path) -> int:
         if sys.platform == "win32":
             try:
                 rendered = word_docx_to_pdf(docx_path, tdp)
-            except ImportError:
+            except Exception:
                 rendered = None
         if rendered is None:
             soffice = find_soffice()
             if not soffice:
                 return 0
-            result = subprocess.run(
-                [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tdp), str(docx_path)],
-                capture_output=True,
-                timeout=300,
-            )
-            if result.returncode != 0:
+            try:
+                result = subprocess.run(
+                    [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tdp), str(docx_path)],
+                    capture_output=True,
+                    timeout=600,
+                )
+                if result.returncode != 0:
+                    return 0
+            except subprocess.TimeoutExpired:
                 return 0
             pdfs = list(tdp.glob("*.pdf"))
             if not pdfs:
                 return 0
             rendered = pdfs[0]
-        redacted = _redact_watermark(rendered)
+        try:
+            redacted = _redact_watermark(rendered)
+        except Exception:
+            return 0
         doc = fitz.open(str(redacted))
         ls_pages = [p for p in doc if p.rect.width > p.rect.height]
         if len(ls_pages) != len(landscape):
