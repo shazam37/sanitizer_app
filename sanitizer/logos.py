@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import imagehash
+import re
 from PIL import Image
 
 _HASH_SIZE = 16
@@ -332,19 +333,54 @@ def replace_brand_text_in_pdf(pdf_path: Path) -> int:
         doc.close()
     return count
 
+def _brand_hsv_colors():
+    import colorsys
+
+    colors = []
+    for f in sorted((_assets_dir() / "publisher").iterdir()):
+        try:
+            img = Image.open(io.BytesIO(f.read_bytes())).convert("RGBA").resize((64, 64))
+        except Exception:
+            continue
+        for px in list(img.getdata()):
+            r, g, b, a = px[0], px[1], px[2], px[3]
+            if a < 128:
+                continue
+            h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+            if s >= 0.3 and v >= 0.15:
+                colors.append(h * 360)
+    return colors
+
+
+def _hue_matches(hex_color: str, brand_hues) -> bool:
+    import colorsys
+
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", hex_color.strip())
+    if not m:
+        return False
+    r = int(m.group(1)[0:2], 16) / 255
+    g = int(m.group(1)[2:4], 16) / 255
+    b = int(m.group(1)[4:6], 16) / 255
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    if s < 0.3 or v < 0.15:
+        return False
+    hue = h * 360
+    return any(min(abs(hue - bh), 360 - abs(hue - bh)) <= 22 for bh in brand_hues)
+
+
 def replace_vector_logos_in_doc(doc, W: str) -> int:
-    """Replace small vector-only shapes at the very start of the document
-    (typical logo placement) with a random dummy logo image."""
+    """Replace vector-only brand shapes (document start or brand-colored)
+    with a random dummy logo image. Covers body, headers and footers."""
     import io as _io
     import re as _re
 
-    from docx.oxml.ns import qn as _qn
     from docx.shared import Emu as _Emu
     from docx.text.paragraph import Paragraph as _Paragraph
 
     _load_references()
     if not _publisher_hashes:
         return 0
+    brand_hues = _brand_hsv_colors()
     root = doc.element
     elements = list(root.iter())
     index_of = {id(el): i for i, el in enumerate(elements)}
@@ -355,35 +391,100 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             break
     if first_text_idx is None:
         return 0
+    story_roots = [(root, doc)]
+    for section in doc.sections:
+        for part in (
+            section.header,
+            section.footer,
+            section.first_page_header,
+            section.first_page_footer,
+            section.even_page_header,
+            section.even_page_footer,
+        ):
+            try:
+                story_roots.append((part._element, part))
+            except Exception:
+                continue
     replaced = 0
-    for pict in list(root.iter(f"{{{W}}}pict")):
-        idx = index_of.get(id(pict))
-        if idx is None or idx >= first_text_idx:
+    branded_parts = set()
+    for root, parent in story_roots:
+        for pict in list(root.iter(f"{{{W}}}pict")):
+            if pict.find(f".//{{{V}}}imagedata") is not None:
+                continue
+            colors = [
+                el.get("fillcolor", "") for el in pict.iter() if el.get("fillcolor")
+            ] + [el.get("strokecolor", "") for el in pict.iter() if el.get("strokecolor")]
+            color_hit = any(_hue_matches(cl, brand_hues) for cl in colors)
+            at_start = index_of.get(id(pict), 10**9) < first_text_idx and root is doc.element
+            has_txbx = pict.find(f".//{{{W}}}txbxContent") is not None
+            if at_start and has_txbx:
+                continue
+            if not (at_start or color_hit):
+                continue
+            style = ""
+            for shape in pict.iter():
+                if shape.get("style"):
+                    style = shape.get("style")
+                    break
+            m_w = _re.search(r"width:([\d.]+)pt", style)
+            m_h = _re.search(r"height:([\d.]+)pt", style)
+            if m_w and m_h:
+                w_pt, h_pt = float(m_w.group(1)), float(m_h.group(1))
+                max_w, max_h = (450, 80) if at_start else (550, 170)
+                if not (8 <= h_pt <= max_h and 15 <= w_pt <= max_w):
+                    continue
+            else:
+                w_pt, h_pt = 86.0, 24.0
+            run_el = pict.getparent()
+            while run_el is not None and run_el.tag != f"{{{W}}}r":
+                run_el = run_el.getparent()
+            p_el = run_el.getparent() if run_el is not None else None
+            if p_el is None:
+                continue
+            para = _Paragraph(p_el, parent)
+            new_run = para.add_run()
+            buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
+            new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
+            p_el.remove(run_el)
+            replaced += 1
+            if color_hit:
+                branded_parts.add(id(parent))
+    for root, parent in story_roots:
+        if id(parent) not in branded_parts or parent is doc:
             continue
-        if pict.find(f".//{{{W}}}txbxContent") is not None:
-            continue
-        style = ""
-        for shape in pict.iter():
-            if shape.get("style"):
-                style = shape.get("style")
-                break
-        m_w = _re.search(r"width:([\d.]+)pt", style)
-        m_h = _re.search(r"height:([\d.]+)pt", style)
-        if not m_w or not m_h:
-            continue
-        w_pt, h_pt = float(m_w.group(1)), float(m_h.group(1))
-        if not (8 <= h_pt <= 80 and 15 <= w_pt <= 450 and w_pt / max(h_pt, 1) >= 1.2):
-            continue
-        run_el = pict.getparent()
-        while run_el is not None and run_el.tag != f"{{{W}}}r":
-            run_el = run_el.getparent()
-        p_el = run_el.getparent() if run_el is not None else None
-        if p_el is None:
-            continue
-        para = _Paragraph(p_el, doc)
-        new_run = para.add_run()
-        buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
-        new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
-        p_el.remove(run_el)
-        replaced += 1
+        for pict in list(root.iter(f"{{{W}}}pict")):
+            if pict.find(f".//{{{V}}}imagedata") is not None:
+                continue
+            if pict.find(f".//{{{W}}}txbxContent") is not None:
+                continue
+            fills = [el.get("fillcolor", "").lower() for el in pict.iter() if el.get("fillcolor")]
+            if not fills or not all(f in ("#000000", "black", "#000") for f in fills):
+                continue
+            style = ""
+            for shape in pict.iter():
+                if shape.get("style"):
+                    style = shape.get("style")
+                    break
+            m_w = _re.search(r"width:([\d.]+)pt", style)
+            m_h = _re.search(r"height:([\d.]+)pt", style)
+            if not m_w or not m_h:
+                continue
+            w_pt, h_pt = float(m_w.group(1)), float(m_h.group(1))
+            if not (4 <= h_pt <= 40 and 5 <= w_pt <= 150):
+                continue
+            run_el = pict.getparent()
+            while run_el is not None and run_el.tag != f"{{{W}}}r":
+                run_el = run_el.getparent()
+            p_el = run_el.getparent() if run_el is not None else None
+            if p_el is None:
+                continue
+            para = _Paragraph(p_el, parent)
+            new_run = para.add_run()
+            buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
+            new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
+            p_el.remove(run_el)
+            replaced += 1
     return replaced
+
+
+V = "urn:schemas-microsoft-com:vml"
