@@ -385,8 +385,9 @@ def _hue_matches(hex_color: str, brand_hues) -> bool:
 
 
 def replace_vector_logos_in_doc(doc, W: str) -> int:
-    """Replace vector-only brand shapes (document start or brand-colored)
-    with a random dummy logo image. Covers body, headers and footers."""
+    """Replace vector-only brand shapes (body, headers, footers) with dummy
+    logos. Adjacent logo shapes are merged and replaced by ONE dummy sized
+    to the combined bounding box."""
     import io as _io
     import re as _re
 
@@ -422,8 +423,8 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             except Exception:
                 continue
     replaced = 0
-    branded_parts = set()
     for root, parent in story_roots:
+        candidates = []
         for pict in list(root.iter(f"{{{W}}}pict")):
             if pict.find(f".//{{{V}}}imagedata") is not None:
                 continue
@@ -435,19 +436,32 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             has_txbx = pict.find(f".//{{{W}}}txbxContent") is not None
             if at_start and has_txbx:
                 continue
-            if not (at_start or color_hit):
-                continue
             style = ""
             for shape in pict.iter():
                 if shape.get("style"):
                     style = shape.get("style")
                     break
+            weak = False
+            if not (at_start or color_hit):
+                fills = [cl.lower() for cl in colors if cl]
+                if fills and all(f in ("#000000", "black", "#000") for f in fills):
+                    m_bw = _re.search(r"width:([\d.]+)pt", style)
+                    m_bh = _re.search(r"height:([\d.]+)pt", style)
+                    if m_bw and m_bh:
+                        bw, bh = float(m_bw.group(1)), float(m_bh.group(1))
+                        if 4 <= bh <= 40 and 5 <= bw <= 150:
+                            weak = True
+                if not weak:
+                    continue
             m_w = _re.search(r"width:([\d.]+)pt", style)
             m_h = _re.search(r"height:([\d.]+)pt", style)
+            m_l = _re.search(r"margin-left:([-\d.]+)pt", style)
+            m_t = _re.search(r"margin-top:([-\d.]+)pt", style)
             if m_w and m_h:
                 w_pt, h_pt = float(m_w.group(1)), float(m_h.group(1))
                 max_w, max_h = (450, 80) if at_start else (550, 170)
-                if not (8 <= h_pt <= max_h and 15 <= w_pt <= max_w):
+                min_w, min_h = (5, 4) if weak else (15, 8)
+                if not (min_h <= h_pt <= max_h and min_w <= w_pt <= max_w):
                     continue
             else:
                 w_pt, h_pt = 86.0, 24.0
@@ -457,49 +471,68 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             p_el = run_el.getparent() if run_el is not None else None
             if p_el is None:
                 continue
-            para = _Paragraph(p_el, parent)
+            candidates.append({
+                "pict": pict,
+                "run": run_el,
+                "p": p_el,
+                "ml": float(m_l.group(1)) if m_l else None,
+                "mt": float(m_t.group(1)) if m_t else None,
+                "w": w_pt,
+                "h": h_pt,
+                "color_hit": color_hit,
+                "at_start": at_start,
+                "weak": weak,
+            })
+        clusters = []
+        used = set()
+        cands = sorted(candidates, key=lambda cd: (cd["p"] is not None, cd["ml"] if cd["ml"] is not None else 0))
+        for i, cd in enumerate(cands):
+            if i in used:
+                continue
+            cluster = [cd]
+            used.add(i)
+            if cd["p"] is not None:
+                for j in range(i + 1, len(cands)):
+                    if j in used:
+                        continue
+                    od = cands[j]
+                    if od["p"] is not cd["p"]:
+                        continue
+                    last = cluster[-1]
+                    if last["ml"] is not None and od["ml"] is not None:
+                        gap = od["ml"] - (last["ml"] + last["w"])
+                        voverlap = abs(od["mt"] - last["mt"]) < max(od["h"], last["h"])
+                        if gap > 30 or not voverlap:
+                            continue
+                    cluster.append(od)
+                    used.add(j)
+            clusters.append(cluster)
+        for cluster in clusters:
+            cluster.sort(key=lambda cd: cd["ml"] if cd["ml"] is not None else 0)
+            if cluster[0]["ml"] is not None and all(cd["ml"] is not None for cd in cluster):
+                x0 = min(cd["ml"] for cd in cluster)
+                x1 = max(cd["ml"] + cd["w"] for cd in cluster)
+                y0 = min(cd["mt"] if cd["mt"] is not None else 0 for cd in cluster)
+                y1 = max(cd["mt"] + cd["h"] if cd["mt"] is not None else 0 for cd in cluster)
+                w_pt = max(x1 - x0, 15)
+                h_pt = max(y1 - y0, 8)
+            else:
+                w_pt = sum(cd["w"] for cd in cluster)
+                h_pt = max(cd["h"] for cd in cluster)
+            anchor_p = cluster[0]["p"]
+            para = _Paragraph(anchor_p, parent)
             new_run = para.add_run()
             buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
             new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
-            p_el.remove(run_el)
+            if cluster[0]["ml"] is not None:
+                anchor_p.remove(new_run._r)
+                first_run = cluster[0]["run"]
+                first_run.addnext(new_run._r)
+            for cd in cluster:
+                cd["p"].remove(cd["run"])
             replaced += 1
-            if color_hit:
-                branded_parts.add(id(parent))
-    for root, parent in story_roots:
-        if id(parent) not in branded_parts or parent is doc:
-            continue
-        for pict in list(root.iter(f"{{{W}}}pict")):
-            if pict.find(f".//{{{V}}}imagedata") is not None:
+            if not any(cd.get("color_hit") or cd.get("at_start") for cd in cluster):
                 continue
-            if pict.find(f".//{{{W}}}txbxContent") is not None:
-                continue
-            fills = [el.get("fillcolor", "").lower() for el in pict.iter() if el.get("fillcolor")]
-            if not fills or not all(f in ("#000000", "black", "#000") for f in fills):
-                continue
-            style = ""
-            for shape in pict.iter():
-                if shape.get("style"):
-                    style = shape.get("style")
-                    break
-            m_w = _re.search(r"width:([\d.]+)pt", style)
-            m_h = _re.search(r"height:([\d.]+)pt", style)
-            if not m_w or not m_h:
-                continue
-            w_pt, h_pt = float(m_w.group(1)), float(m_h.group(1))
-            if not (4 <= h_pt <= 40 and 5 <= w_pt <= 150):
-                continue
-            run_el = pict.getparent()
-            while run_el is not None and run_el.tag != f"{{{W}}}r":
-                run_el = run_el.getparent()
-            p_el = run_el.getparent() if run_el is not None else None
-            if p_el is None:
-                continue
-            para = _Paragraph(p_el, parent)
-            new_run = para.add_run()
-            buf = _io.BytesIO(_random_dummy_bytes((int(w_pt * 4), int(h_pt * 4)), "PNG"))
-            new_run.add_picture(buf, width=_Emu(int(w_pt * 12700)), height=_Emu(int(h_pt * 12700)))
-            p_el.remove(run_el)
-            replaced += 1
     return replaced
 
 
