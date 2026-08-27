@@ -88,16 +88,75 @@ def _image_bytes_is_logo(data: bytes) -> bool:
 
 def replace_logos_in_docx(docx_path: Path) -> int:
     import zipfile
+    import re as _re2
+    import xml.etree.ElementTree as _ET
 
     _load_references()
     if not _publisher_hashes:
         return 0
-    replaced = 0
     src = zipfile.ZipFile(str(docx_path), "r")
+    # Collect media targets referenced only from headers/footers so body images stay untouched.
+    hf_targets: set[str] = set()
+    try:
+        names = src.namelist()
+        hf_xmls = [n for n in names if (n.startswith("word/header") or n.startswith("word/footer")) and n.endswith(".xml")]
+        for hf in hf_xmls:
+            try:
+                xml_bytes = src.read(hf)
+                # r:embed ids in header/footer xml
+                ids = _re2.findall(r'embed="([^"]+)"', xml_bytes.decode("utf8", "ignore"))
+                ids += _re2.findall(r'id="([^"]+)"', xml_bytes.decode("utf8", "ignore"))
+            except Exception:
+                continue
+            # Resolve ids via rels
+            rels_candidates = [
+                "word/_rels/" + hf.split("/")[-1] + ".rels",
+                hf + ".rels",
+                hf.replace("word/", "word/_rels/") + ".rels",
+            ]
+            rels_data = None
+            rels_name = None
+            for rn in rels_candidates:
+                if rn in names:
+                    rels_name = rn
+                    try:
+                        rels_data = src.read(rn)
+                    except Exception:
+                        rels_data = None
+                    break
+            if rels_data is None:
+                continue
+            try:
+                root_rels = _ET.fromstring(rels_data)
+                for rel in root_rels.iter():
+                    rid = rel.get("Id")
+                    tgt = rel.get("Target")
+                    if rid in ids and tgt:
+                        # Target like media/image1.png or ../media/image1.png
+                        t = tgt.split("/")[-1]
+                        # find full word/media/ entry
+                        for n in names:
+                            if n.endswith("/" + t) and n.startswith("word/media/"):
+                                hf_targets.add(n)
+                        # also handle direct
+                        if tgt.startswith("media/"):
+                            hf_targets.add("word/" + tgt)
+            except Exception:
+                continue
+        # Fallback: if no rels found but hf xml directly references media via regex, skip
+    except Exception:
+        hf_targets = set()
+    # If we have headers/footers but couldn't resolve, avoid touching body:
+    # only replace when we have a non-empty allow-list. Empty allow-list => 0.
+    if not hf_targets:
+        # No header/footer image refs found; do not touch body images.
+        src.close()
+        return 0
+    replaced = 0
     entries = []
     for info in src.infolist():
         data = src.read(info.filename)
-        if info.filename.startswith("word/media/") and len(data) > 0:
+        if info.filename in hf_targets and len(data) > 0:
             try:
                 img = Image.open(io.BytesIO(data))
                 img.load()
@@ -129,6 +188,9 @@ def replace_logos_in_pdf(pdf_path: Path) -> int:
     doc = fitz.open(str(pdf_path))
     replaced = 0
     for page in doc:
+        h = page.rect.height
+        top_limit = page.rect.y0 + h * 0.15
+        bottom_limit = page.rect.y1 - h * 0.10
         seen = set()
         for img in page.get_images(full=True):
             xref = img[0]
@@ -152,8 +214,12 @@ def replace_logos_in_pdf(pdf_path: Path) -> int:
             if not _is_publisher_logo(pil):
                 continue
             rects = page.get_image_rects(xref)
+            # Only replace if image lies in header (top 15%) or footer (bottom 10%)
+            hf_rects = [r for r in rects if r.y1 <= top_limit or r.y0 >= bottom_limit]
+            if not hf_rects:
+                continue
             dummy = _random_dummy_bytes(pil.size, "PNG")
-            for r in rects:
+            for r in hf_rects:
                 page.add_redact_annot(r)
                 page.apply_redactions()
                 page.insert_image(r, stream=dummy)
@@ -219,8 +285,8 @@ def _replace_alias_across_runs(p_elem, alias: str, replacement: str, W: str) -> 
 
 
 def replace_brand_text_in_doc(doc, W: str) -> int:
-    """Replace publisher-name text: wordmark paragraphs get a dummy logo image,
-    other mentions become 'Publisher'. Operates on a python-docx Document."""
+    """Replace publisher-name text. Headers/footers wordmarks get a dummy logo;
+    body wordmarks become Lorum Ipsum text so body logos stay untouched."""
     import io as _io
 
     from docx.shared import Emu as _Emu
@@ -231,7 +297,7 @@ def replace_brand_text_in_doc(doc, W: str) -> int:
         return 0
     aliases = _publisher_names()
     count = 0
-    roots = [doc.element]
+    roots: list[tuple[object, bool]] = [(doc.element, False)]
     for section in doc.sections:
         for part in (
             section.header,
@@ -242,11 +308,15 @@ def replace_brand_text_in_doc(doc, W: str) -> int:
             section.even_page_footer,
         ):
             try:
-                roots.append(part._element)
+                roots.append((part._element, True))
             except Exception:
                 continue
-    for root in roots:
+    for root, is_hf in roots:
         for p_elem in list(root.iter(f"{{{W}}}p")):
+            # Paragraph needs its owning element for add_run; body uses doc, HF uses part
+            owner = doc if not is_hf else None
+            # Resolve owner from root parent: for HF we stored part element, need its document
+            # Fallback: use doc for Paragraph construction (python-docx accepts any)
             para = _Paragraph(p_elem, doc)
             full = para.text.strip()
             hit_alias = None
@@ -260,31 +330,34 @@ def replace_brand_text_in_doc(doc, W: str) -> int:
             if hit_alias is None:
                 continue
             if len(full) <= len(hit_alias) + 10:
-                for run in list(para.runs):
-                    run.text = ""
-                size_pt = 0
-                for r_el in p_elem.findall(f".//{{{W}}}sz"):
+                if is_hf:
+                    for run in list(para.runs):
+                        run.text = ""
+                    size_pt = 0
+                    for r_el in p_elem.findall(f".//{{{W}}}sz"):
+                        try:
+                            size_pt = max(size_pt, int(r_el.get(f"{{{W}}}val", "0")) / 2)
+                        except (TypeError, ValueError):
+                            continue
+                    if size_pt <= 0:
+                        size_pt = 14.0
+                    width_pt = min(size_pt * 0.6 * max(len(hit_alias), 1), 550)
+                    height_pt = min(size_pt * 1.3, 170)
                     try:
-                        size_pt = max(size_pt, int(r_el.get(f"{{{W}}}val", "0")) / 2)
-                    except (TypeError, ValueError):
-                        continue
-                if size_pt <= 0:
-                    size_pt = 14.0
-                width_pt = min(size_pt * 0.6 * max(len(hit_alias), 1), 550)
-                height_pt = min(size_pt * 1.3, 170)
-                try:
-                    run = para.add_run()
-                    buf = _io.BytesIO(
-                        _random_dummy_bytes((int(width_pt * 4), int(height_pt * 4)), "PNG")
-                    )
-                    run.add_picture(
-                        buf,
-                        width=_Emu(int(width_pt * 12700)),
-                        height=_Emu(int(height_pt * 12700)),
-                    )
-                except Exception:
-                    pass
-                count += 1
+                        run = para.add_run()
+                        buf = _io.BytesIO(
+                            _random_dummy_bytes((int(width_pt * 4), int(height_pt * 4)), "PNG")
+                        )
+                        run.add_picture(
+                            buf,
+                            width=_Emu(int(width_pt * 12700)),
+                            height=_Emu(int(height_pt * 12700)),
+                        )
+                    except Exception:
+                        pass
+                    count += 1
+                else:
+                    count += _replace_alias_across_runs(p_elem, hit_alias, "Lorum Ipsum", W)
             else:
                 count += _replace_alias_across_runs(p_elem, hit_alias, "Lorum Ipsum", W)
     return count
@@ -392,12 +465,12 @@ def _hue_matches(hex_color: str, brand_hues) -> bool:
 
 
 def replace_vector_logos_in_doc(doc, W: str) -> int:
-    """Replace tracked-brand vector logos in headers, footers and page-top
-    corners with a random dummy of the same size/proportion. Adjacent shapes
-    forming one lockup merge into a single dummy. Mid-page body content is
-    never touched."""
+    """Replace tracked-brand vector logos with random dummies. Headers/footers
+    are always scanned; body only at document corners (first/last page cover)
+    so page-5 charts stay untouched."""
     import io as _io
     import re as _re
+    import bisect as _bisect_mod
 
     from docx.shared import Emu as _Emu
     from docx.text.paragraph import Paragraph as _Paragraph
@@ -407,17 +480,8 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
         return 0
     brand_hues = _brand_hsv_colors()
     root = doc.element
-    elements = list(root.iter())
-    index_of = {id(el): i for i, el in enumerate(elements)}
-    first_text_idx = None
-    for el in elements:
-        if el.tag == f"{{{W}}}t" and (el.text or "").strip():
-            first_text_idx = index_of[id(el)]
-            break
-    if first_text_idx is None:
-        return 0
 
-    groups = []
+    story_roots: list[tuple[object, object, bool]] = []
     for section in doc.sections:
         for part in (
             section.header,
@@ -428,32 +492,17 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             section.even_page_footer,
         ):
             try:
-                groups.append((part._element, part))
+                story_roots.append((part._element, part, True))
             except Exception:
                 continue
+    # Body only for first/last page corners (covers) — not mid-document like page 5
+    story_roots.append((root, doc, False))
+    if not story_roots:
+        return 0
 
-    body = root.find(f"{{{W}}}body")
-    children = list(body)
-    corner_zone = set()
-    start = 0
-    boundaries = [i for i, ch in enumerate(children) if ch.tag == f"{{{W}}}sectPr" or ch.find(f"{{{W}}}pPr/{{{W}}}sectPr") is not None]
-    boundaries.append(len(children) - 1)
-    for e in boundaries:
-        first_text = None
-        for i in range(start, e + 1):
-            txt = "".join(children[i].itertext())
-            if len(txt.strip()) > 100:
-                first_text = i
-                break
-        limit = max(first_text if first_text is not None else 0, min(start + 8, e))
-        for i in range(start, min(limit + 1, e + 1)):
-            corner_zone.add(children[i])
-        start = e + 1
-
-    def _collect(members, corner_only):
+    def _collect(root, is_hf):
         cands = []
-        iterator = members if isinstance(members, list) else members.iter(f"{{{W}}}pict")
-        for pict in list(iterator):
+        for pict in list(root.iter(f"{{{W}}}pict")):
             if pict.find(f".//{{{V}}}imagedata") is not None:
                 continue
             if pict.find(f".//{{{W}}}txbxContent") is not None:
@@ -462,6 +511,12 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
                 el.get("fillcolor", "") for el in pict.iter() if el.get("fillcolor")
             ] + [el.get("strokecolor", "") for el in pict.iter() if el.get("strokecolor")]
             color_hit = any(_hue_matches(cl, brand_hues) for cl in colors)
+            if not color_hit:
+                if not is_hf:
+                    continue
+                fills = [cl.lower() for cl in colors if cl]
+                if not fills or not all(f in ("#000000", "black", "#000") for f in fills):
+                    continue
             style = ""
             for shape in pict.iter():
                 if shape.get("style"):
@@ -475,21 +530,15 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
                 continue
             w_pt = float(m_w.group(1))
             h_pt = float(m_h.group(1))
-            max_h = 120 if corner_only else 170
-            max_w = 300 if corner_only else 550
-            if not (4 <= h_pt <= max_h and 5 <= w_pt <= max_w):
+            if not (4 <= h_pt <= 120 and 5 <= w_pt <= 550):
                 continue
-            if corner_only:
-                run_el = pict.getparent()
-                while run_el is not None and run_el.tag != f"{{{W}}}r":
-                    run_el = run_el.getparent()
-                p_el = run_el.getparent() if run_el is not None else None
-                if p_el is None or p_el not in corner_zone:
-                    continue
-            if not color_hit:
-                fills = [cl.lower() for cl in colors if cl]
-                if not fills or not all(f in ("#000000", "black", "#000") for f in fills):
-                    continue
+            if not is_hf and not (8 <= h_pt <= 170 and 15 <= w_pt <= 550):
+                continue
+            shape_count = sum(
+                1 for el in pict.iter() if el.tag in (f"{{{V}}}shape", f"{{{V}}}group")
+            )
+            if shape_count > (400 if is_hf else 120):
+                continue
             run_el = pict.getparent()
             while run_el is not None and run_el.tag != f"{{{W}}}r":
                 run_el = run_el.getparent()
@@ -504,15 +553,40 @@ def replace_vector_logos_in_doc(doc, W: str) -> int:
             })
         return cands
 
-    corner_picts = [pict for p_el in corner_zone for pict in p_el.iter(f"{{{W}}}pict")]
-    groups.append((corner_picts, doc))
+    # Document corners = very first child (cover) and very last section start
+    body = root.find(f"{{{W}}}body")
+    body_children = list(body) if body is not None else []
+    child_index = {id(ch): i for i, ch in enumerate(body_children)}
+    boundaries = [
+        i for i, ch in enumerate(body_children)
+        if ch.tag == f"{{{W}}}sectPr" or ch.find(f"{{{W}}}pPr/{{{W}}}sectPr") is not None
+    ]
+    section_starts = [0] + [b + 1 for b in boundaries[:-1]] if boundaries else [0]
+    last_start = section_starts[-1] if section_starts else 0
+
+    def _is_document_corner(p_el) -> bool:
+        top = p_el
+        while top.getparent() is not None and top.getparent() is not body:
+            top = top.getparent()
+        idx = child_index.get(id(top))
+        if idx is None:
+            return False
+        # First page cover: first 2 children only (not all before first_text which includes page 5)
+        if idx <= 2:
+            return True
+        # Last page cover: within first 3 children of last section
+        return idx >= last_start and idx <= last_start + 3
 
     replaced = 0
-    for members, parent in groups:
-        cands = _collect(members, corner_only=(parent is None))
+    for root, parent, is_hf in story_roots:
+        cands = _collect(root, is_hf)
         if not cands:
             continue
-        cands.sort(key=lambda cd: (id(cd["p"]), cd["ml"]))
+        if not is_hf:
+            cands = [cd for cd in cands if _is_document_corner(cd["p"])]
+            if not cands:
+                continue
+        cands = sorted(cands, key=lambda cd: (id(cd["p"]), cd["ml"]))
         used = set()
         for i, cd in enumerate(cands):
             if i in used:
